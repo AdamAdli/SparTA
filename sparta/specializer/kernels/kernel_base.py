@@ -259,11 +259,11 @@ class KernelBase:
             unique_id += hashlib.sha1(mask_str.encode()).hexdigest()[:6]
         return unique_id
 
-    def test(
+    def _create_test(
         self, config: Dict, mask: Optional[Dict[str, np.ndarray]] = None,
         inputs: Dict[str, np.ndarray] = None, target_outputs: Dict[str, np.ndarray] = None,
-        num_warmups: int = 10, num_iters: int = 10, check_results: bool = True
-    ) -> float:
+        num_warmups: int = 10, num_iters: int = 10, check_results: bool = True, dir: str = None
+    ):
         unique_id = self.configure(config, mask, True)
         if inputs is not None:
             for k, v in inputs.items():
@@ -271,24 +271,47 @@ class KernelBase:
         for input_tensor in self.inputs.values():
             if input_tensor.dense_data is None and input_tensor.sparse_data is None:
                 input_tensor.generate_data()
-        test_inputs = self.inputs.values()
         if target_outputs is not None:
             for k, v in target_outputs.items():
                 self.set_target_output(k, v)
         elif check_results:
             self.calc_target_outputs()
-        test_outputs = self.outputs.values() if check_results else None
-        test_func = TestInterface(
+        return TestInterface(
             unique_id=unique_id,
             kernel_code=self.get_kernel_code(),
             shape=config,
             threads_per_block=self.threads_per_block(),
             blocks_per_grid=self.blocks_per_grid(),
             inputs=self.inputs.values(),
-            outputs=self.outputs.values()
+            outputs=self.outputs.values(),
+            dir=dir
         )
+
+    def test(
+        self, config: Dict, mask: Optional[Dict[str, np.ndarray]] = None,
+        inputs: Dict[str, np.ndarray] = None, target_outputs: Dict[str, np.ndarray] = None,
+        num_warmups: int = 10, num_iters: int = 10, check_results: bool = True, dir: str = None
+    ) -> float:
+        test_func = self._create_test(config, mask, inputs, target_outputs, num_warmups, num_iters, check_results, dir=dir)
+        test_inputs = self.inputs.values()
+        test_outputs = self.outputs.values() if check_results else None
         lat = test_func(test_inputs, test_outputs, num_warmups, num_iters, check_results)
         return lat
+
+    def render_test_code(self, config: Dict, output_filepath: str, mask: Optional[Dict[str, np.ndarray]] = None,
+        inputs: Dict[str, np.ndarray] = None, target_outputs: Dict[str, np.ndarray] = None,
+        num_warmups: int = 10, num_iters: int = 10, check_results: bool = True, dir: str = None):
+        test_func = self._create_test(config, mask, inputs, target_outputs, num_warmups, num_iters, check_results, dir=dir)
+        test_func.render_code(output_filepath)
+
+    def render_test_pkg(self, config: Dict, mask: Optional[Dict[str, np.ndarray]] = None,
+                         inputs: Dict[str, np.ndarray] = None, target_outputs: Dict[str, np.ndarray] = None,
+                         num_warmups: int = 10, num_iters: int = 10, check_results: bool = True, dir: str = None):
+        test_func = self._create_test(config, mask, inputs, target_outputs, num_warmups, num_iters, check_results,
+                                      dir=dir)
+        test_inputs = self.inputs.values()
+        test_outputs = self.outputs.values() if check_results else None
+        test_func.render_pkg(test_inputs, test_outputs, num_warmups, num_iters, check_results)
 
     def compile(self, config: Dict, mask: Dict[str, np.ndarray], jit: bool = True):
         unique_id = self.configure(config, mask, False)
@@ -445,13 +468,22 @@ class KernelInterface(abc.ABC):
 
 class TestInterface(KernelInterface, Callable):
 
-    def _build(self):
-        self._dir = os.path.join('/tmp/sparta', self._id)
+    def __init__(self, unique_id: str, kernel_code: str, shape: Dict[str, Any], threads_per_block: Tuple[int],
+                 blocks_per_grid: Tuple[int], inputs: Iterable[_Tensor], outputs: Iterable[_Tensor], dir: str=None):
+        if dir is None:
+            self._dir = os.path.join('/tmp/sparta', unique_id)
+        else:
+            self._dir = dir
+        super().__init__(unique_id, kernel_code, shape, threads_per_block, blocks_per_grid, inputs, outputs)
+
+    def _build(self, local_tensor_dirs=False):
+        if self._dir is None:
+            self._dir = os.path.join('/tmp/sparta', self._id)
         if not os.path.exists(self._dir):
             os.makedirs(self._dir)
-        self._specify_data_path(self._config['INPUTS'])
-        self._specify_data_path(self._config['OUTPUTS'])
-        with open(os.path.join(TEMPLATE_DIR, 'test.cu.j2')) as f:
+        self._specify_data_path(self._config['INPUTS'], local_tensor_dirs)
+        self._specify_data_path(self._config['OUTPUTS'], local_tensor_dirs)
+        with open(os.path.join(TEMPLATE_DIR, 'test.cu.j2'), 'r') as f:
             self._template = f.read()
         self._code_path = os.path.join(self._dir, f'test.cu')
         self._exec_path = os.path.join(self._dir, 'test')
@@ -466,9 +498,47 @@ class TestInterface(KernelInterface, Callable):
             timeout=5
         )
 
-    def _specify_data_path(self, desc_list: Dict):
+    def render_code(self, output_filepath):
+        with open(output_filepath, 'w') as f:
+            f.write(jinja2.Template(self._template).render(self._config))
+
+    def render_pkg(self, inputs: Iterable[_Tensor], target_outputs: Optional[Iterable[_Tensor]] = None,
+        num_warmups: int = 10, num_iters: int = 10, check_results: bool = True, dir=None):
+
+        if dir:
+            self._dir = dir
+
+        self._build(local_tensor_dirs=True)
+
+        for tensor in inputs:
+            self._save_tensor(tensor)
+        if target_outputs is not None:
+            for tensor in target_outputs:
+                self._save_tensor(tensor)
+
+        with open(os.path.join(self._dir, 'test.cu'), 'w') as f:
+            f.write(jinja2.Template(self._template).render(self._config))
+
+        with open(os.path.join(self._dir, 'build.sh'), 'w') as fp_sh:
+            gpu_code = utils.cuda_detect()[0][1]
+            build_args = f'arch=compute_{gpu_code},code=sm_{gpu_code}'
+            fp_sh.write(f"nvcc -gencode {build_args} ./test.cu -w -o ./test")
+
+        with open(os.path.join(self._dir, 'run.sh'), 'w') as fp_sh:
+            fp_sh.write(f'./test {num_warmups} {num_iters} {int(check_results)}')
+
+        try:
+            self._build_exe()
+        except Exception as e:
+            print(e)
+
+
+    def _specify_data_path(self, desc_list: Dict, local_tensor_dirs=False):
         for desc in desc_list:
-            desc['filepath'] = os.path.join(self._dir, f'{desc["name"]}.dat')
+            if local_tensor_dirs:
+                desc['filepath'] = os.path.join('./', f'{desc["name"]}.dat')
+            else:
+                desc['filepath'] = os.path.join(self._dir, f'{desc["name"]}.dat')
 
     def _save_tensor(self, tensor: _Tensor):
         if tensor.layout == 'dense':
@@ -491,7 +561,7 @@ class TestInterface(KernelInterface, Callable):
         self._build_exe()
         result = self._run_cmd(
             f'{self._exec_path} {num_warmups} {num_iters} {int(check_results)}',
-            timeout=1 + 0.01 * num_iters
+            timeout=1 + 0.2 * num_iters
         )
         shutil.rmtree(self._dir, ignore_errors=True)
         return float(result)
